@@ -1,329 +1,184 @@
-import os
 import json
-import requests
-from openai import OpenAI
-from tools.github_tools import (
-    get_pr_files,
-    get_pr_diff,
-    get_repo_files
-)
+import logging
+import os
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
+from strands import Agent
+from strands.models.openai import OpenAIModel
 
 from tools.best_practices_tools import get_best_practices
+from tools.github_tools import find_repo_files, get_pr_diff, get_pr_files, get_repo_files
 
-# ================================
-# CONFIG 
-# ================================
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ================================
-# TOOL REGISTRY (FOR LLM)
-# ================================
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_pr_files",
-            "description": "Get files changed in the pull request",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "owner": {"type": "string"},
-                    "repo": {"type": "string"},
-                    "pr_number": {"type": "integer"}
-                },
-                "required": ["owner", "repo", "pr_number"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_pr_diff",
-            "description": "Get code diff of the pull request",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "owner": {"type": "string"},
-                    "repo": {"type": "string"},
-                    "pr_number": {"type": "integer"}
-                },
-                "required": ["owner", "repo", "pr_number"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_repo_files",
-            "description": "Get all files in repository",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "owner": {"type": "string"},
-                    "repo": {"type": "string"}
-                },
-                "required": ["owner", "repo"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_best_practices",
-            "description": "Get engineering checklist",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
-        }
+
+class Finding(BaseModel):
+    rule: str
+    category: str
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    file: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    description: str
+    code_snippet: str
+
+    @model_validator(mode="after")
+    def validate_line_range(self) -> "Finding":
+        if self.end_line < self.start_line:
+            raise ValueError("end_line must be greater than or equal to start_line")
+        return self
+
+
+class ReviewSummary(BaseModel):
+    total_findings: int = Field(ge=0)
+    high_or_critical: int = Field(ge=0)
+
+
+class ReviewResult(BaseModel):
+    run_id: str
+    pr_number: int
+    status: Literal["PASS", "FAIL"]
+    summary: ReviewSummary
+    findings: list[Finding] = Field(default_factory=list)
+
+
+def build_system_prompt() -> str:
+     return """
+You are a senior .NET code review agent.
+
+Operating rules:
+- Use the available tools to gather pull request context before deciding.
+- Analyze the pull request per file, not as one undifferentiated block.
+- Only report concrete issues supported by the fetched diff, file list, repo context, or checklist.
+- Do not invent missing code or hidden context.
+- One issue must produce one finding.
+- Findings must point to the modified file they belong to.
+- Use diff line numbers for start_line and end_line.
+- Set status to FAIL if any finding is HIGH or CRITICAL. Otherwise set PASS.
+- If no issues exist, return an empty findings list.
+
+Severity rubric (apply consistently):
+- CRITICAL: security vulnerability, data loss risk, or broken authentication
+- HIGH: correctness bug, exception risk, or data integrity issue
+- MEDIUM: design flaw, maintainability concern, or missing error handling
+- LOW: style issue, minor naming inconsistency, or non-critical nit
+
+Required workflow (all steps are mandatory):
+1. Get the list of changed files.
+2. Get the PR diff.
+3. Get the best-practices checklist.
+4. Get the full repo file tree. After receiving it, perform this test coverage analysis:
+    a. Identify which changed files belong to a business, service, application, or domain layer.
+        A file is in scope if its name ends with any of: Service.cs, Handler.cs, Manager.cs, UseCase.cs,
+        CommandHandler.cs, QueryHandler.cs, Validator.cs, Repository.cs — OR its path contains any of:
+        /Services/, /Application/, /Handlers/, /Domain/, /UseCases/, /Commands/, /Queries/, /Features/
+    b. For each in-scope file, extract the base class name (e.g. OrderService from OrderService.cs).
+    c. For each base class name, call the find_repo_files tool with contains set to the class name.
+       Treat test coverage as present only if any returned match includes "test" or "spec" in the file name.
+    d. Also call find_repo_files for key dependencies referenced in changed code (interfaces, repositories,
+       external clients, and services) when context is unclear, so conclusions are grounded in repo evidence.
+    e. If NO matching test file exists anywhere in the repo, report a MEDIUM finding against the changed file
+        with rule "7.1 Business Logic Must Be Tested".
+5. Produce the final structured report covering both code quality issues and test coverage gaps.
+""".strip()
+
+
+def build_review_prompt(owner: str, repo: str, pr_number: int) -> str:
+    return f"""
+Review pull request {pr_number} in repository {owner}/{repo}.
+
+Requirements:
+- Analyze changed files independently.
+- Prefer many precise findings over broad summaries.
+- Do not report style nits unless they clearly violate the checklist or create risk.
+- Keep code_snippet short and directly relevant.
+- If you need evidence for tests or dependencies, call tools to verify instead of guessing.
+""".strip()
+
+
+def build_agent() -> Agent:
+    model = OpenAIModel(
+        model_id=OPENAI_MODEL,
+        client_args={"api_key": require_env("OPENAI_API_KEY")},
+        params={"temperature": 0, "seed": 42},
+    )
+    return Agent(
+        model=model,
+        tools=[get_pr_files, get_pr_diff, get_repo_files, find_repo_files, get_best_practices],
+        system_prompt=build_system_prompt(),
+        callback_handler=None,
+        load_tools_from_directory=False,
+        structured_output_model=ReviewResult,
+        name="dotnet-code-review-agent",
+        description="Reviews .NET pull requests against a best-practices checklist.",
+    )
+
+
+def normalize_review_result(result: ReviewResult, run_id: str, pr_number: int) -> ReviewResult:
+    unique_findings = {
+        (finding.file, finding.start_line, finding.rule): finding
+        for finding in result.findings
     }
-]
+    findings = sorted(
+        unique_findings.values(),
+        key=lambda finding: (finding.file, finding.start_line, finding.rule),
+    )
+    high_or_critical = sum(
+        1 for finding in findings if finding.severity in {"HIGH", "CRITICAL"}
+    )
+    status: Literal["PASS", "FAIL"] = "FAIL" if high_or_critical > 0 else "PASS"
 
-# ================================
-# TOOL EXECUTOR
-# ================================
+    return ReviewResult(
+        run_id=run_id,
+        pr_number=pr_number,
+        status=status,
+        summary=ReviewSummary(
+            total_findings=len(findings),
+            high_or_critical=high_or_critical,
+        ),
+        findings=findings,
+    )
 
-def run_tool(name, args):
-    if name == "get_pr_files":
-        return get_pr_files(args["owner"], args["repo"], args["pr_number"], GITHUB_TOKEN)
 
-    if name == "get_pr_diff":
-        return get_pr_diff(args["owner"], args["repo"], args["pr_number"], GITHUB_TOKEN)
+def run_agent(owner: str, repo: str, pr_number: int, run_id: str = "LOCAL_RUN") -> ReviewResult:
+    logger.info("Starting review owner=%s repo=%s pr=%s model=%s", owner, repo, pr_number, OPENAI_MODEL)
+    agent = build_agent()
+    result = agent(
+        build_review_prompt(owner, repo, pr_number),
+        structured_output_model=ReviewResult,
+    )
 
-    if name == "get_repo_files":
-        return get_repo_files(args["owner"], args["repo"], GITHUB_TOKEN)
+    if result.structured_output is None:
+        raise ValueError("Agent returned no structured output")
 
-    if name == "get_best_practices":
-        return get_best_practices()
-
-    raise Exception(f"Unknown tool: {name}")
-
-# ================================
-# JSON PARSER
-# ================================
-
-def clean_json(text):
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-    return text.strip()
-
-def parse_json(text):
-    return json.loads(clean_json(text))
-
-# ================================
-# AGENT LOOP
-# ================================
-
-def run_agent(owner, repo, pr_number):
-
-    used_tools = set()
-
-    messages = [
-        {
-            "role": "system",
-            "content": f"""
-You are a senior .NET Code Review Agent.
-
-You have tools to:
-- get_pr_files
-- get_pr_diff
-- get_repo_files
-- get_best_practices
-
-----------------------------------------
-CORE STRATEGY (MANDATORY)
-----------------------------------------
-
-You MUST analyze the pull request PER FILE.
-
-Process:
-1. Identify all changed files
-2. For EACH file:
-   - analyze independently
-   - detect issues
-   - produce findings for that file
-3. Combine all findings at the end
-
-----------------------------------------
-CRITICAL RULES
-----------------------------------------
-
-- DO NOT analyze the entire PR as one block
-- DO NOT group findings across files
-- DO NOT group multiple issues in one finding
-
-✔ ONE FILE → MANY FINDINGS  
-✔ ONE ISSUE → ONE FINDING  
-
-----------------------------------------
-OUTPUT CONTRACT (STRICT)
-----------------------------------------
-
-Return ONLY JSON:
-
-{{
-  "run_id": "LOCAL_RUN",
-  "pr_number": {pr_number},
-  "status": "PASS | FAIL",
-  "summary": {{
-    "total_findings": number,
-    "high_or_critical": number
-  }},
-  "findings": [
-    {{
-      "rule": "string",
-      "category": "string",
-      "severity": "LOW | MEDIUM | HIGH | CRITICAL",
-      "file": "string",
-      "start_line": number,
-      "end_line": number,
-      "description": "string",
-      "code_snippet": "string"
-    }}
-  ]
-}}
-
-----------------------------------------
-FILE ANALYSIS RULES
-----------------------------------------
-
-- Each file must be analyzed independently
-- Findings must reference ONLY the file being analyzed
-- DO NOT mix findings between files
-
-----------------------------------------
-LINE RULES
-----------------------------------------
-
-- start_line REQUIRED
-- end_line REQUIRED
-- Use diff line numbers
-- If single line → same value
-
-----------------------------------------
-SEVERITY RULES
-----------------------------------------
-
-- LOW
-- MEDIUM
-- HIGH
-- CRITICAL
-
-----------------------------------------
-FAIL RULE
-----------------------------------------
-
-- If ANY HIGH or CRITICAL → FAIL
-
-----------------------------------------
-IMPORTANT
-----------------------------------------
-
-- Prefer MANY small findings
-- NEVER group issues
-- NEVER summarize multiple issues
-
-----------------------------------------
-Return ONLY JSON
-"""
-        },
-        {
-            "role": "user",
-            "content": f"Review PR {pr_number} in {owner}/{repo}"
-        }
-    ]
-
-    while True:
-
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=messages,
-            tools=tools,
-            temperature=0
-        )
-
-        msg = response.choices[0].message
-
-        print("\n🧠 Agent Step")
-        print(msg)
-
-        # =========================
-        # TOOL CALL
-        # =========================
-        if msg.tool_calls:
-            messages.append(msg)
-
-            for tool_call in msg.tool_calls:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments or "{}")
-
-                # 🚫 Prevent repeated tool calls
-                if name in used_tools:
-                    print(f"⚠️ Skipping repeated tool: {name}")
-                    continue
-
-                used_tools.add(name)
-
-                print(f"🔧 Tool Call: {name}")
-
-                try:
-                    result = run_tool(name, args)
-                except Exception as e:
-                    result = {"error": str(e)}
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(result)[:8000]
-                })
-
-        else:
-            print("✅ Final Answer Generated")
-
-            result = parse_json(msg.content)
-
-            # Deduplicate
-            seen = set()
-            unique = []
-
-            for f in result.get("findings", []):
-                key = (f["file"], f["start_line"], f["rule"])
-                if key not in seen:
-                    seen.add(key)
-                    unique.append(f)
-
-            # Sort
-            unique = sorted(
-                unique,
-                key=lambda x: (x["file"], x["start_line"], x["rule"])
-            )
-
-            # Recalculate
-            high_or_critical = sum(
-                1 for f in unique if f["severity"] in ["HIGH", "CRITICAL"]
-            )
-
-            result["findings"] = unique
-            result["summary"] = {
-                "total_findings": len(unique),
-                "high_or_critical": high_or_critical
-            }
-            result["status"] = "FAIL" if high_or_critical > 0 else "PASS"
-
-            return result
+    normalized = normalize_review_result(result.structured_output, run_id, pr_number)
+    tool_metrics = getattr(result.metrics, "tool_metrics", None)
+    tool_call_count = len(tool_metrics) if tool_metrics else 0
+    logger.info(
+        "Completed review status=%s findings=%s tool_calls=%s",
+        normalized.status,
+        normalized.summary.total_findings,
+        tool_call_count,
+    )
+    return normalized
 
 # ================================
 # ENFORCEMENT
 # ================================
 
 def enforce(result):
-    if result["status"] == "FAIL":
+    if result.status == "FAIL":
         print("❌ Review FAILED")
         return False
     else:
@@ -344,6 +199,6 @@ if __name__ == "__main__":
     result = run_agent(owner, repo, pr_number)
 
     print("\n========== RESULT ==========\n")
-    print(json.dumps(result, indent=2))
+    print(result.model_dump_json(indent=2))
 
     enforce(result)

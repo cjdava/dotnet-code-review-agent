@@ -7,12 +7,14 @@ An AI-powered code review agent for .NET pull requests. It uses Strands Agents w
 - Uses a Strands `Agent(...)` with the OpenAI model provider
 - Defines GitHub and checklist access as Python tools with the `@tool` decorator
 - Fetches PR diff, changed files, and repo file tree from GitHub through agent tools
+- Uses targeted repository lookups to verify test coverage and dependency context
 - Loads a best-practices checklist from a remote source
 - Analyzes each file independently and produces structured findings
 - Validates the final report with Pydantic structured output
 - Normalizes findings before output by deduplicating entries and recalculating summary fields
 - Returns a JSON report with severity-rated findings (LOW / MEDIUM / HIGH / CRITICAL)
 - Fails the review if any HIGH or CRITICAL issues are found
+- Uses deterministic model parameters (`temperature=0`, fixed seed) for more consistent runs
 
 ## Core Concepts
 
@@ -60,6 +62,9 @@ This project defines the following tools in the `tools/` directory:
 - `get_repo_files`
   Gets the repository file tree so the agent can inspect broader repo context.
 
+- `find_repo_files`
+  Finds repository files by name/path matching so the agent can verify test files and dependencies.
+
 - `get_best_practices`
   Gets the best-practices checklist used as the review baseline.
 
@@ -70,7 +75,7 @@ The agent is built in `build_agent()` inside `strand-agent.py`.
 It is configured with:
 
 - an OpenAI model via `OpenAIModel(...)`
-- the four tools listed above
+- the five tools listed above
 - a system prompt that tells the model how to review a PR
 - a Pydantic output schema named `ReviewResult`
 - `callback_handler=None` to avoid noisy default console callbacks
@@ -80,7 +85,7 @@ Conceptually, it looks like this:
 ```python
 agent = Agent(
     model=model,
-    tools=[get_pr_files, get_pr_diff, get_repo_files, get_best_practices],
+  tools=[get_pr_files, get_pr_diff, get_repo_files, find_repo_files, get_best_practices],
     system_prompt=build_system_prompt(),
     structured_output_model=ReviewResult,
 )
@@ -92,13 +97,14 @@ The agent receives a prompt such as:
 
 - review PR 29 in a given repository
 
-From there, the model decides which tools it needs. A typical flow is:
+From there, the model follows a required evidence-gathering flow:
 
 1. Call `get_pr_files` to see what changed.
 2. Call `get_pr_diff` to inspect the code changes.
 3. Call `get_best_practices` to get the review rules.
-4. Optionally call `get_repo_files` if broader repository context is needed.
-5. Produce a final `ReviewResult` object.
+4. Call `get_repo_files` to inspect repository structure.
+5. Call `find_repo_files` to verify test-file and dependency evidence for changed business/service/domain code.
+6. Produce a final `ReviewResult` object.
 
 The tool-calling loop is handled by Strands internally. This means the application does not need to manually:
 
@@ -235,6 +241,7 @@ dotnet-code-review-agent/
 
 - `strand-agent.py` builds a Strands `Agent` with an `OpenAIModel`
 - The tools in `tools/` use the `@tool` decorator and return normalized tool results
+- `find_repo_files` enables targeted repo evidence checks instead of relying only on broad tree inspection
 - The final report is validated against a Pydantic schema before being printed
 - A small normalization pass deduplicates findings and recalculates summary and status
 
@@ -243,4 +250,5 @@ dotnet-code-review-agent/
 - `OPENAI_API_KEY` is required when the agent is created
 - `GITHUB_TOKEN` is required when GitHub-backed tools are executed
 - Missing environment variables now fail with clearer runtime errors instead of failing during module import
+- The model is configured for consistency using `temperature=0` and a fixed seed
 - The final review result is printed as validated JSON via `model_dump_json(indent=2)`

@@ -118,3 +118,64 @@ def get_repo_files(owner: str, repo: str, tool_context: ToolContext) -> dict[str
     data = response.json()
     files = [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
     return _success({"files": files[:1000]})
+
+
+@tool(context=True)
+def find_repo_files(
+    owner: str,
+    repo: str,
+    contains: str,
+    suffix: str = "",
+    limit: int = 200,
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Find repository files by case-insensitive name/path matching.
+
+    Args:
+        owner: GitHub repository owner.
+        repo: GitHub repository name.
+        contains: Case-insensitive substring that must exist in file path.
+        suffix: Optional case-insensitive suffix filter (for example, "Tests.cs").
+        limit: Maximum number of matching file paths to return.
+    """
+    if tool_context is not None:
+        logger.info(
+            "tool=%s tool_use_id=%s owner=%s repo=%s contains=%s suffix=%s",
+            tool_context.tool_use["name"],
+            tool_context.tool_use["toolUseId"],
+            owner,
+            repo,
+            contains,
+            suffix,
+        )
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"
+    response = requests.get(url, headers=_github_headers(), timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+    data = response.json()
+    files = [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
+
+    contains_lower = contains.lower().strip()
+    suffix_lower = suffix.lower().strip()
+    normalized_limit = max(1, min(limit, 1000))
+
+    matches = []
+    for path in files:
+        lower_path = path.lower()
+        if contains_lower and contains_lower not in lower_path:
+            continue
+        if suffix_lower and not lower_path.endswith(suffix_lower):
+            continue
+        matches.append(path)
+        if len(matches) >= normalized_limit:
+            break
+
+    return _success(
+        {
+            "contains": contains,
+            "suffix": suffix,
+            "matches": matches,
+            "returned": len(matches),
+        }
+    )

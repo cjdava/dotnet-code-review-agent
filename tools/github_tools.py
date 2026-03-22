@@ -1,3 +1,4 @@
+import base64
 import logging
 import os
 from typing import Any
@@ -177,5 +178,58 @@ def find_repo_files(
             "suffix": suffix,
             "matches": matches,
             "returned": len(matches),
+        }
+    )
+
+
+@tool(context=True)
+def get_repo_file_content(
+    owner: str,
+    repo: str,
+    path: str,
+    ref: str = "HEAD",
+    max_chars: int = 12000,
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Get text content for a repository file.
+
+    Args:
+        owner: GitHub repository owner.
+        repo: GitHub repository name.
+        path: Repository-relative file path.
+        ref: Git ref to read from.
+        max_chars: Maximum number of decoded characters to return.
+    """
+    if tool_context is not None:
+        logger.info(
+            "tool=%s tool_use_id=%s owner=%s repo=%s path=%s ref=%s",
+            tool_context.tool_use["name"],
+            tool_context.tool_use["toolUseId"],
+            owner,
+            repo,
+            path,
+            ref,
+        )
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    response = requests.get(
+        url,
+        headers=_github_headers(),
+        params={"ref": ref},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    encoded_content = data.get("content", "")
+    normalized_limit = max(1, min(max_chars, 50000))
+    decoded_content = base64.b64decode(encoded_content).decode("utf-8", errors="replace")
+
+    return _success(
+        {
+            "path": path,
+            "ref": ref,
+            "content": decoded_content[:normalized_limit],
+            "truncated": len(decoded_content) > normalized_limit,
         }
     )

@@ -8,7 +8,13 @@ from strands import Agent
 from strands.models.openai import OpenAIModel
 
 from tools.best_practices_tools import get_best_practices
-from tools.github_tools import find_repo_files, get_pr_diff, get_pr_files, get_repo_files
+from tools.github_tools import (
+    find_repo_files,
+    get_pr_diff,
+    get_pr_files,
+    get_repo_file_content,
+    get_repo_files,
+)
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
@@ -54,7 +60,7 @@ class ReviewResult(BaseModel):
 
 
 def build_system_prompt() -> str:
-     return """
+    return """
 You are a senior .NET code review agent.
 
 Operating rules:
@@ -78,19 +84,24 @@ Required workflow (all steps are mandatory):
 1. Get the list of changed files.
 2. Get the PR diff.
 3. Get the best-practices checklist.
-4. Get the full repo file tree. After receiving it, perform this test coverage analysis:
+4. Get the full repo file tree.
+5. Use the repo file tree to locate `.sln` and relevant `.csproj` files. Read the main solution file and the relevant project files before concluding anything about dependencies or test coverage.
+    a. The `.sln` file tells you which projects exist in the solution and helps identify likely test projects.
+    b. The `.csproj` files tell you about `ProjectReference`, `PackageReference`, target frameworks, and whether a project is a test project.
+    c. Use the solution and project structure as evidence when evaluating test coverage and dependency-related rules from the checklist.
+6. After reading the solution and project files, perform this test coverage and dependency analysis:
     a. Identify which changed files belong to a business, service, application, or domain layer.
-        A file is in scope if its name ends with any of: Service.cs, Handler.cs, Manager.cs, UseCase.cs,
-        CommandHandler.cs, QueryHandler.cs, Validator.cs, Repository.cs — OR its path contains any of:
-        /Services/, /Application/, /Handlers/, /Domain/, /UseCases/, /Commands/, /Queries/, /Features/
+         A file is in scope if its name ends with any of: Service.cs, Handler.cs, Manager.cs, UseCase.cs,
+         CommandHandler.cs, QueryHandler.cs, Validator.cs, Repository.cs — OR its path contains any of:
+         /Services/, /Application/, /Handlers/, /Domain/, /UseCases/, /Commands/, /Queries/, /Features/
     b. For each in-scope file, extract the base class name (e.g. OrderService from OrderService.cs).
     c. For each base class name, call the find_repo_files tool with contains set to the class name.
        Treat test coverage as present only if any returned match includes "test" or "spec" in the file name.
     d. Also call find_repo_files for key dependencies referenced in changed code (interfaces, repositories,
        external clients, and services) when context is unclear, so conclusions are grounded in repo evidence.
-    e. If NO matching test file exists anywhere in the repo, report a MEDIUM finding against the changed file
-        with rule "7.1 Business Logic Must Be Tested".
-5. Produce the final structured report covering both code quality issues and test coverage gaps.
+     e. When dependency structure matters, inspect the owning project's `.csproj` to verify whether dependencies are injected, referenced, or coupled correctly instead of inferring from class names alone.
+     f. Use the checklist as the sole source of truth for whether missing tests or dependency structure constitute a finding and what severity to assign.
+7. Produce the final structured report covering code quality issues, dependency concerns, and test coverage gaps.
 """.strip()
 
 
@@ -104,6 +115,7 @@ Requirements:
 - Do not report style nits unless they clearly violate the checklist or create risk.
 - Keep code_snippet short and directly relevant.
 - If you need evidence for tests or dependencies, call tools to verify instead of guessing.
+- Use `.sln` and `.csproj` contents when you need to understand project boundaries, references, and test projects.
 """.strip()
 
 
@@ -115,7 +127,14 @@ def build_agent() -> Agent:
     )
     return Agent(
         model=model,
-        tools=[get_pr_files, get_pr_diff, get_repo_files, find_repo_files, get_best_practices],
+        tools=[
+            get_pr_files,
+            get_pr_diff,
+            get_repo_files,
+            find_repo_files,
+            get_repo_file_content,
+            get_best_practices,
+        ],
         system_prompt=build_system_prompt(),
         callback_handler=None,
         load_tools_from_directory=False,

@@ -8,6 +8,7 @@ An AI-powered code review agent for .NET pull requests. It uses Strands Agents w
 - Defines GitHub and checklist access as Python tools with the `@tool` decorator
 - Fetches PR diff, changed files, and repo file tree from GitHub through agent tools
 - Uses targeted repository lookups to verify test coverage and dependency context
+- Reads `.sln` and `.csproj` files to understand solution structure, project references, and test projects
 - Loads a best-practices checklist from a remote source
 - Analyzes each file independently and produces structured findings
 - Validates the final report with Pydantic structured output
@@ -45,6 +46,7 @@ Without tools, the model only knows what is in the prompt. With tools, the agent
 - files changed in a pull request
 - the pull request diff
 - repository file paths
+- repository file contents
 - the review checklist
 
 In this project, tools are regular Python functions decorated with `@tool`. That decorator allows Strands to expose them to the agent as callable capabilities.
@@ -65,6 +67,9 @@ This project defines the following tools in the `tools/` directory:
 - `find_repo_files`
   Finds repository files by name/path matching so the agent can verify test files and dependencies.
 
+- `get_repo_file_content`
+  Reads repository file contents so the agent can inspect `.sln`, `.csproj`, and source files directly.
+
 - `get_best_practices`
   Gets the best-practices checklist used as the review baseline.
 
@@ -75,7 +80,7 @@ The agent is built in `build_agent()` inside `strand-agent.py`.
 It is configured with:
 
 - an OpenAI model via `OpenAIModel(...)`
-- the five tools listed above
+- the six tools listed above
 - a system prompt that tells the model how to review a PR
 - a Pydantic output schema named `ReviewResult`
 - `callback_handler=None` to avoid noisy default console callbacks
@@ -85,7 +90,7 @@ Conceptually, it looks like this:
 ```python
 agent = Agent(
     model=model,
-  tools=[get_pr_files, get_pr_diff, get_repo_files, find_repo_files, get_best_practices],
+    tools=[get_pr_files, get_pr_diff, get_repo_files, find_repo_files, get_repo_file_content, get_best_practices],
     system_prompt=build_system_prompt(),
     structured_output_model=ReviewResult,
 )
@@ -103,8 +108,9 @@ From there, the model follows a required evidence-gathering flow:
 2. Call `get_pr_diff` to inspect the code changes.
 3. Call `get_best_practices` to get the review rules.
 4. Call `get_repo_files` to inspect repository structure.
-5. Call `find_repo_files` to verify test-file and dependency evidence for changed business/service/domain code.
-6. Produce a final `ReviewResult` object.
+5. Call `find_repo_files` to locate relevant tests, projects, and dependency-related files.
+6. Call `get_repo_file_content` to inspect `.sln`, `.csproj`, and source files when project boundaries or references matter.
+7. Produce a final `ReviewResult` object based on repo evidence and the coding standards checklist.
 
 The tool-calling loop is handled by Strands internally. This means the application does not need to manually:
 
@@ -115,6 +121,8 @@ The tool-calling loop is handled by Strands internally. This means the applicati
 ### What Is Structured Output?
 
 Structured output means the final answer is not just free-form text. It must match a defined schema.
+
+The decision about whether something is actually a finding should come from the coding standards checklist, not from hardcoded policy in the prompt. The prompt tells the agent how to gather evidence; the checklist tells it what counts as a violation and what severity applies.
 
 In this project, the schema is defined with Pydantic models:
 
@@ -242,6 +250,8 @@ dotnet-code-review-agent/
 - `strand-agent.py` builds a Strands `Agent` with an `OpenAIModel`
 - The tools in `tools/` use the `@tool` decorator and return normalized tool results
 - `find_repo_files` enables targeted repo evidence checks instead of relying only on broad tree inspection
+- `get_repo_file_content` lets the agent inspect `.sln` and `.csproj` files before making dependency or test coverage claims
+- The prompt is procedural: it tells the agent how to gather evidence, while the checklist remains the source of truth for findings and severity
 - The final report is validated against a Pydantic schema before being printed
 - A small normalization pass deduplicates findings and recalculates summary and status
 

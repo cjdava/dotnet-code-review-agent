@@ -9,13 +9,16 @@ An AI-powered code review agent for .NET pull requests. It uses Strands Agents w
 - Fetches PR diff, changed files, and repo file tree from GitHub through agent tools
 - Uses targeted repository lookups to verify test coverage and dependency context
 - Reads `.sln` and `.csproj` files to understand solution structure, project references, and test projects
-- Loads a best-practices checklist from a remote source
+- Loads a best-practices checklist from a configurable remote URL
 - Analyzes each file independently and produces structured findings
 - Validates the final report with Pydantic structured output
 - Normalizes findings before output by deduplicating entries and recalculating summary fields
 - Returns a JSON report with severity-rated findings (LOW / MEDIUM / HIGH / CRITICAL)
 - Fails the review if any HIGH or CRITICAL issues are found
 - Uses deterministic model parameters (`temperature=0`, fixed seed) for more consistent runs
+- Centralizes all configuration in a single `config.py` using `pydantic-settings` with `.env` file support
+- Loads system and review prompts from external Markdown files in `prompts/`
+- Returns structured tool errors instead of crashing on HTTP or network failures
 
 ## Core Concepts
 
@@ -71,7 +74,7 @@ This project defines the following tools in the `tools/` directory:
   Reads repository file contents so the agent can inspect `.sln`, `.csproj`, and source files directly.
 
 - `get_best_practices`
-  Gets the best-practices checklist used as the review baseline.
+  Fetches one or more best-practices checklists and merges them into a single combined ruleset. Each source is fetched independently and labeled with its URL, allowing enterprise, team, and project-level rules to all apply in one review.
 
 ### How Is The Agent Defined?
 
@@ -171,12 +174,20 @@ This keeps the final output consistent even if the model returns redundant findi
    pip install -r requirements.txt
    ```
 
-3. Set environment variables:
+3. Create your `.env` file from the provided example and fill in your credentials:
    ```bash
-   export OPENAI_API_KEY="your-openai-api-key"
-   export GITHUB_TOKEN="your-github-pat"
+   cp .env.example .env
    ```
-   Add these to `~/.zshrc` (macOS) to persist across sessions.
+
+   Then edit `.env`:
+   ```
+   OPENAI_API_KEY=your-openai-api-key
+   GITHUB_TOKEN=your-github-pat
+   ```
+
+   The `.env` file is automatically loaded by `config.py` at startup. You can also export these as shell environment variables — shell values take precedence over the `.env` file.
+
+   Missing required variables (`OPENAI_API_KEY`, `GITHUB_TOKEN`) cause the app to fail immediately on startup with a clear validation error.
 
 ## Usage
 
@@ -200,12 +211,21 @@ If you are using the workspace virtual environment directly:
 /Users/christianjoshuadava/Desktop/development/ai/.venv/bin/python strand-agent.py
 ```
 
-Optional environment variables:
+Optional variables (set in `.env` or shell, defaults shown):
 
-```bash
-export OPENAI_MODEL="gpt-4.1-mini"
-export LOG_LEVEL="INFO"
 ```
+OPENAI_MODEL=gpt-4.1-mini
+LOG_LEVEL=INFO
+REQUEST_TIMEOUT=30
+
+# Single source
+BEST_PRACTICES_URLS=https://raw.githubusercontent.com/cjdava/best-practices/main/code-peer-review.md
+
+# Multiple layered sources (enterprise, team, project)
+BEST_PRACTICES_URLS=https://enterprise.example.com/standards.md,https://team.example.com/rules.md,https://raw.githubusercontent.com/cjdava/best-practices/main/code-peer-review.md
+```
+
+All URLs in `BEST_PRACTICES_URLS` are fetched and merged into one checklist. If some sources fail but at least one succeeds, the tool proceeds with a warning instead of blocking the review.
 
 ## Output
 
@@ -237,28 +257,37 @@ export LOG_LEVEL="INFO"
 
 ```
 dotnet-code-review-agent/
-├── requirements.txt       # Python dependencies
-├── strand-agent.py        # Main Strands agent entry point
+├── .env.example                    # Template for required environment variables
+├── config.py                       # Centralized configuration via pydantic-settings
+├── requirements.txt                # Python dependencies
+├── strand-agent.py                 # Main Strands agent entry point
+├── prompts/
+│   ├── system_prompt.md            # Agent system prompt (editable without code changes)
+│   └── review_prompt.md            # Per-review prompt template
 └── tools/
     ├── __init__.py
-    ├── github_tools.py    # Strands GitHub tools
-    └── best_practices_tools.py  # Strands best-practices tool
+    ├── github_tools.py             # Strands GitHub tools
+    └── best_practices_tools.py     # Strands best-practices tool
 ```
 
 ## Architecture
 
-- `strand-agent.py` builds a Strands `Agent` with an `OpenAIModel`
-- The tools in `tools/` use the `@tool` decorator and return normalized tool results
-- `find_repo_files` enables targeted repo evidence checks instead of relying only on broad tree inspection
-- `get_repo_file_content` lets the agent inspect `.sln` and `.csproj` files before making dependency or test coverage claims
-- The prompt is procedural: it tells the agent how to gather evidence, while the checklist remains the source of truth for findings and severity
-- The final report is validated against a Pydantic schema before being printed
-- A small normalization pass deduplicates findings and recalculates summary and status
+- `config.py` centralizes all configuration using `pydantic-settings`. It auto-loads a `.env` file and validates required fields on startup. `OPENAI_API_KEY` and `GITHUB_TOKEN` are `SecretStr` fields so they are never accidentally logged.
+- `prompts/system_prompt.md` and `prompts/review_prompt.md` hold the agent prompts as external Markdown files. They are loaded at runtime so you can tune review behavior without touching Python code.
+- `strand-agent.py` builds a Strands `Agent` with an `OpenAIModel` and wires it to the tool set and prompts.
+- `get_best_practices` supports multiple checklist sources via `BEST_PRACTICES_URLS`. Each URL is fetched independently and combined under its source label. This allows enterprise, team, and project-level rules to coexist. Partial failures (one URL unreachable) degrade gracefully with a warning rather than failing the entire review.
+- The tools in `tools/` use the `@tool` decorator. All tools return a structured `{status, content}` response — on HTTP errors, timeouts, or decode failures they return an error payload instead of raising, so the agent can reason about partial failures gracefully.
+- `find_repo_files` enables targeted repo evidence checks instead of relying only on broad tree inspection.
+- `get_repo_file_content` lets the agent inspect `.sln` and `.csproj` files before making dependency or test coverage claims.
+- The system prompt is procedural: it tells the agent how to gather evidence, while the checklist remains the source of truth for findings and severity.
+- The final report is validated against a Pydantic schema before being printed.
+- A normalization pass deduplicates findings and recalculates summary and status.
 
 ## Notes
 
-- `OPENAI_API_KEY` is required when the agent is created
-- `GITHUB_TOKEN` is required when GitHub-backed tools are executed
-- Missing environment variables now fail with clearer runtime errors instead of failing during module import
-- The model is configured for consistency using `temperature=0` and a fixed seed
-- The final review result is printed as validated JSON via `model_dump_json(indent=2)`
+- `OPENAI_API_KEY` and `GITHUB_TOKEN` are required and validated at startup via `pydantic-settings`.
+- Secret values are stored as `SecretStr` and accessed with `.get_secret_value()` — they will not appear in logs or stack traces.
+- The model is configured for consistency using `temperature=0` and a fixed seed.
+- The final review result is printed as validated JSON via `model_dump_json(indent=2)`.
+- To customize the review prompt or system instructions, edit the files in `prompts/` directly — no code changes needed.
+- To add or change best-practices sources, update `BEST_PRACTICES_URLS` in `.env` with a comma-separated list of URLs.

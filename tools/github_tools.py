@@ -1,25 +1,18 @@
 import base64
+import binascii
 import logging
-import os
 from typing import Any
 
 import requests
 from strands import ToolContext, tool
 
-REQUEST_TIMEOUT = 30
+from config import settings
 
 logger = logging.getLogger(__name__)
 
 
-def _require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
 def _github_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
-    headers = {"Authorization": f"Bearer {_require_env('GITHUB_TOKEN')}"}
+    headers = {"Authorization": f"Bearer {settings.github_token.get_secret_value()}"}
     if extra_headers:
         headers.update(extra_headers)
     return headers
@@ -29,6 +22,13 @@ def _success(data: Any) -> dict[str, Any]:
     return {
         "status": "success",
         "content": [{"json": data}],
+    }
+
+
+def _error(message: str) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "content": [{"json": {"error": message}}],
     }
 
 
@@ -51,8 +51,18 @@ def get_pr_files(owner: str, repo: str, pr_number: int, tool_context: ToolContex
     )
 
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
-    response = requests.get(url, headers=_github_headers(), timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    try:
+        response = requests.get(url, headers=_github_headers(), timeout=settings.request_timeout)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.warning("tool=get_pr_files HTTP error status=%s url=%s", exc.response.status_code, url)
+        return _error(f"GitHub API returned HTTP {exc.response.status_code} for PR {pr_number}")
+    except requests.Timeout:
+        logger.warning("tool=get_pr_files request timed out url=%s", url)
+        return _error(f"Request timed out fetching files for PR {pr_number}")
+    except requests.RequestException as exc:
+        logger.warning("tool=get_pr_files request failed url=%s error=%s", url, exc)
+        return _error(f"Request failed: {exc}")
 
     files = response.json()
     summarized_files = [
@@ -87,12 +97,23 @@ def get_pr_diff(owner: str, repo: str, pr_number: int, tool_context: ToolContext
     )
 
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
-    response = requests.get(
-        url,
-        headers=_github_headers({"Accept": "application/vnd.github.v3.diff"}),
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.get(
+            url,
+            headers=_github_headers({"Accept": "application/vnd.github.v3.diff"}),
+            timeout=settings.request_timeout,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.warning("tool=get_pr_diff HTTP error status=%s url=%s", exc.response.status_code, url)
+        return _error(f"GitHub API returned HTTP {exc.response.status_code} fetching diff for PR {pr_number}")
+    except requests.Timeout:
+        logger.warning("tool=get_pr_diff request timed out url=%s", url)
+        return _error(f"Request timed out fetching diff for PR {pr_number}")
+    except requests.RequestException as exc:
+        logger.warning("tool=get_pr_diff request failed url=%s error=%s", url, exc)
+        return _error(f"Request failed: {exc}")
+
     return _success({"diff": response.text[:8000]})
 
 
@@ -113,8 +134,18 @@ def get_repo_files(owner: str, repo: str, tool_context: ToolContext) -> dict[str
     )
 
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"
-    response = requests.get(url, headers=_github_headers(), timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    try:
+        response = requests.get(url, headers=_github_headers(), timeout=settings.request_timeout)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.warning("tool=get_repo_files HTTP error status=%s url=%s", exc.response.status_code, url)
+        return _error(f"GitHub API returned HTTP {exc.response.status_code} fetching file tree for {repo}")
+    except requests.Timeout:
+        logger.warning("tool=get_repo_files request timed out url=%s", url)
+        return _error(f"Request timed out fetching file tree for {repo}")
+    except requests.RequestException as exc:
+        logger.warning("tool=get_repo_files request failed url=%s error=%s", url, exc)
+        return _error(f"Request failed: {exc}")
 
     data = response.json()
     files = [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
@@ -151,8 +182,18 @@ def find_repo_files(
         )
 
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"
-    response = requests.get(url, headers=_github_headers(), timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    try:
+        response = requests.get(url, headers=_github_headers(), timeout=settings.request_timeout)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        logger.warning("tool=find_repo_files HTTP error status=%s url=%s", exc.response.status_code, url)
+        return _error(f"GitHub API returned HTTP {exc.response.status_code} fetching file tree for {repo}")
+    except requests.Timeout:
+        logger.warning("tool=find_repo_files request timed out url=%s", url)
+        return _error(f"Request timed out fetching file tree for {repo}")
+    except requests.RequestException as exc:
+        logger.warning("tool=find_repo_files request failed url=%s error=%s", url, exc)
+        return _error(f"Request failed: {exc}")
 
     data = response.json()
     files = [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
@@ -212,18 +253,37 @@ def get_repo_file_content(
         )
 
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    response = requests.get(
-        url,
-        headers=_github_headers(),
-        params={"ref": ref},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.get(
+            url,
+            headers=_github_headers(),
+            params={"ref": ref},
+            timeout=settings.request_timeout,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code
+        if status_code == 404:
+            logger.warning("tool=get_repo_file_content file not found path=%s ref=%s", path, ref)
+            return _error(f"File not found: {path} at ref {ref}")
+        logger.warning("tool=get_repo_file_content HTTP error status=%s path=%s", status_code, path)
+        return _error(f"GitHub API returned HTTP {status_code} for {path}")
+    except requests.Timeout:
+        logger.warning("tool=get_repo_file_content request timed out path=%s", path)
+        return _error(f"Request timed out reading {path}")
+    except requests.RequestException as exc:
+        logger.warning("tool=get_repo_file_content request failed path=%s error=%s", path, exc)
+        return _error(f"Request failed: {exc}")
 
     data = response.json()
     encoded_content = data.get("content", "")
     normalized_limit = max(1, min(max_chars, 50000))
-    decoded_content = base64.b64decode(encoded_content).decode("utf-8", errors="replace")
+
+    try:
+        decoded_content = base64.b64decode(encoded_content).decode("utf-8", errors="replace")
+    except binascii.Error as exc:
+        logger.warning("tool=get_repo_file_content failed to decode content path=%s error=%s", path, exc)
+        return _error(f"Failed to decode file content for {path}: not valid base64")
 
     return _success(
         {
